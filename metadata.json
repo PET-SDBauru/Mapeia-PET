@@ -1,0 +1,6 @@
+{
+  "name": "SUS-Digital Maps Bariri",
+  "description": "Dashboard interativo do projeto PET-Saúde Digital para mapear infraestrutura e fluxo nas UBSs de Bariri - SP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

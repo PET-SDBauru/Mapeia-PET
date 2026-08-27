@@ -1102,7 +1102,7 @@ Seja extremamente detalhado, técnico e forneça orientações aplicáveis à re
                   {questionnaireStructure.map((q) => {
                     const isOpen = Boolean(openAccordions[q.id]);
                     const currentCounts = quantData[q.id] || {};
-                    const totalQ = Object.values(currentCounts).reduce((s, n) => s + n, 0);
+                    const totalQ = Object.values(currentCounts).reduce((s: number, n: unknown) => s + (typeof n === "number" ? n : 0), 0);
 
                     return (
                       <div key={q.id} className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden transition-all">

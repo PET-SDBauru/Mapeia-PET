@@ -25,7 +25,9 @@ async function startServer() {
         return;
       }
 
-      const apiKey = customApiKey || process.env.QWEN_API_KEY;
+      // Só a chave do próprio usuário: cair numa chave do servidor transformaria
+      // esta rota num proxy aberto que qualquer um na rede pode usar.
+      const apiKey = customApiKey;
 
       if (!apiKey) {
         res.status(400).json({ 
@@ -52,7 +54,10 @@ async function startServer() {
         throw new Error(data.error?.message || "Erro retornado pela API do Qwen.");
       }
 
-      const generatedText = data.choices[0].message.content;
+      const generatedText = data.choices?.[0]?.message?.content;
+      if (!generatedText) {
+        throw new Error("Resposta vazia da API do Qwen.");
+      }
       res.json({ text: generatedText });
 
     } catch (error: any) {

@@ -14,13 +14,8 @@ import os
 import json
 import re
 
-# Firebase Admin SDK (opcional — ativado apenas se as credenciais estiverem configuradas)
-try:
-    import firebase_admin
-    from firebase_admin import credentials, storage as fb_storage
-    FIREBASE_ADMIN_AVAILABLE = True
-except ImportError:
-    FIREBASE_ADMIN_AVAILABLE = False
+# Armazenamento de imagens/documentos (Firebase ou local) — ver docs/ARMAZENAMENTO.md
+from storage import CATEGORIES, MAX_FILE_SIZE_BYTES, UploadError, create_storage, upload
 
 # ==========================================================
 # 1. CONFIGURAÇÃO DA PÁGINA
@@ -32,19 +27,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Constantes
-MAX_FILE_SIZE_BYTES = 200 * 1024 * 1024  # 200 MB
-
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
-if "uploaded_files" not in st.session_state:
-    st.session_state.uploaded_files = []
-if "qualitative_notes" not in st.session_state:
-    st.session_state.qualitative_notes = ""
-if "gestao_notes" not in st.session_state:
-    st.session_state.gestao_notes = ""
-if "ai_report" not in st.session_state:
-    st.session_state.ai_report = ""
 
 # ==========================================================
 # 2. ESTILIZAÇÃO CSS
@@ -56,16 +40,6 @@ st.markdown("""
     .main-title { font-size: 2.2rem; font-weight: 700; color: #002B49; margin-bottom: 0.3rem; }
     .subtitle { font-size: 1rem; color: #00B259; margin-bottom: 1.5rem; font-weight: 600; }
     .sidebar-title { font-weight: bold; color: #002B49; }
-    .report-box {
-        background: #f8faff;
-        border: 1.5px solid #0052cc22;
-        border-radius: 10px;
-        padding: 1.2rem 1.5rem;
-        margin-top: 1rem;
-        font-size: 0.92rem;
-        line-height: 1.65;
-        color: #1a2540;
-    }
     .upload-success {
         background: #e6f7ef;
         border: 1.5px solid #00B25955;
@@ -79,43 +53,37 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================================
-# 3. INICIALIZAÇÃO DO FIREBASE ADMIN (STORAGE)
+# 3. ARMAZENAMENTO (FIREBASE STORAGE + FIRESTORE, OU LOCAL)
 # ==========================================================
-def _init_firebase_storage():
-    """
-    Inicializa o Firebase Admin SDK usando credenciais armazenadas em
-    st.secrets['FIREBASE_SERVICE_ACCOUNT'] (JSON inline) ou no arquivo
-    .streamlit/secrets.toml.
-    Retorna o bucket do Storage ou None em modo offline.
-    """
-    if not FIREBASE_ADMIN_AVAILABLE:
-        return None
-
-    if not firebase_admin._apps:
-        try:
-            # Tenta carregar credencial de st.secrets (Streamlit Cloud / AI Studio)
-            if "FIREBASE_SERVICE_ACCOUNT" in st.secrets:
-                sa_info = dict(st.secrets["FIREBASE_SERVICE_ACCOUNT"])
-                cred = credentials.Certificate(sa_info)
-            # Tenta variável de ambiente GOOGLE_APPLICATION_CREDENTIALS
-            elif os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-                cred = credentials.ApplicationDefault()
-            else:
-                return None  # Nenhuma credencial disponível → modo offline
-
-            storage_bucket = st.secrets.get("FIREBASE_STORAGE_BUCKET", os.getenv("FIREBASE_STORAGE_BUCKET", ""))
-            firebase_admin.initialize_app(cred, {"storageBucket": storage_bucket})
-        except Exception as e:
-            st.sidebar.caption(f"⚠️ Firebase offline: {e}")
-            return None
-
+def _secret(key: str, default=None):
+    """Lê de st.secrets sem quebrar quando não existe secrets.toml."""
     try:
-        bucket = fb_storage.bucket()
-        return bucket
+        return st.secrets[key]
     except Exception:
-        return None
+        return default
 
-firebase_bucket = _init_firebase_storage()
+
+@st.cache_resource
+def get_store():
+    """
+    Cria o backend de armazenamento uma única vez por processo.
+    Credenciais (em ordem):
+      1. st.secrets["FIREBASE_SERVICE_ACCOUNT"] (tabela TOML com o JSON da conta de serviço)
+      2. arquivo JSON apontado por GOOGLE_APPLICATION_CREDENTIALS
+    Sem credenciais → armazenamento local em data/uploads/.
+    """
+    service_account = _secret("FIREBASE_SERVICE_ACCOUNT")
+    if service_account is not None:
+        service_account = dict(service_account)
+    elif os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        with open(os.environ["GOOGLE_APPLICATION_CREDENTIALS"], encoding="utf-8") as f:
+            service_account = json.load(f)
+
+    bucket = _secret("FIREBASE_STORAGE_BUCKET") or os.getenv("FIREBASE_STORAGE_BUCKET")
+    return create_storage(service_account, bucket)
+
+
+store = get_store()
 
 # ==========================================================
 # 4. DADOS DE CIDADES E UBSs (COORDENADAS APROXIMADAS)
@@ -256,24 +224,9 @@ questionario = {
 # 6. FUNÇÕES AUXILIARES
 # ==========================================================
 
-def upload_to_firebase_storage(file_bytes: bytes, file_name: str, unidade_id: str,
-                                 content_type: str) -> str | None:
-    """
-    Realiza upload para o Firebase Storage Admin SDK.
-    Retorna a URL pública assinada ou None se não for possível.
-    """
-    if firebase_bucket is None:
-        return None
-    try:
-        safe_name = re.sub(r"[^\w.\-]", "_", file_name)
-        blob_path = f"unidades_saude/{unidade_id}/{safe_name}"
-        blob = firebase_bucket.blob(blob_path)
-        blob.upload_from_string(file_bytes, content_type=content_type)
-        blob.make_public()
-        return blob.public_url
-    except Exception as e:
-        st.warning(f"⚠️ Upload Firebase falhou, arquivo salvo apenas localmente: {e}")
-        return None
+def format_size(n_bytes: int) -> str:
+    kb = n_bytes / 1024
+    return f"{kb / 1024:.1f} MB" if kb > 1024 else f"{kb:.0f} KB"
 
 
 def build_qwen_prompt(ubs_name: str, dados_quant: dict, notas_campo: str,
@@ -409,7 +362,10 @@ api_model = st.sidebar.selectbox(
     index=0
 )
 
-firebase_status = "🟢 Firebase Storage ativo" if firebase_bucket else "🟡 Firebase offline (modo local)"
+firebase_status = (
+    "🟢 Firebase Storage ativo" if store.name == "firebase"
+    else "🟡 Firebase offline (armazenamento local)"
+)
 st.sidebar.caption(firebase_status)
 
 # ==========================================================
@@ -519,9 +475,9 @@ if st.session_state.logged_in:
         st.markdown("#### ✏️ Observações Qualitativas & Notas de Campo (Editável)")
         st.caption("Estes campos são incluídos diretamente no prompt enviado ao Qwen. Preencha com observações do pesquisador e contexto local.")
 
-        st.session_state.qualitative_notes = st.text_area(
+        # Sem value=: a key por UBS guarda o texto de cada unidade separadamente.
+        notas_campo = st.text_area(
             label="Relato de Campo do Pesquisador / Percepções da Equipe",
-            value=st.session_state.qualitative_notes,
             height=120,
             placeholder=(
                 "Exemplo: A equipe relata sobrecarga no período da tarde. Profissionais registram sinais vitais "
@@ -530,9 +486,8 @@ if st.session_state.logged_in:
             key=f"campo_notas_{unidade_id}"
         )
 
-        st.session_state.gestao_notes = st.text_area(
+        diretrizes_gestao = st.text_area(
             label="Diretrizes e Prioridades da Gestão Local",
-            value=st.session_state.gestao_notes,
             height=90,
             placeholder=(
                 "Exemplo: A gestão municipal priorizou a eliminação de fichas físicas no 2º semestre de 2026 "
@@ -562,15 +517,15 @@ if st.session_state.logged_in:
                 prompt = build_qwen_prompt(
                     ubs_name=ubs_selecionada,
                     dados_quant=respostas_quantitativas,
-                    notas_campo=st.session_state.qualitative_notes,
-                    diretrizes_gestao=st.session_state.gestao_notes,
+                    notas_campo=notas_campo,
+                    diretrizes_gestao=diretrizes_gestao,
                     mode=modo
                 )
 
                 with st.spinner(f"🔄 Qwen ({api_model}) analisando {ubs_selecionada}..."):
                     try:
                         resultado = call_qwen_api(prompt, api_key, api_model)
-                        st.session_state.ai_report = resultado
+                        st.session_state[f"ai_report_{unidade_id}"] = resultado
                         st.success("✅ Relatório gerado com sucesso!")
                     except requests.exceptions.HTTPError as e:
                         st.error(f"❌ Erro HTTP na API do OpenRouter: {e.response.status_code} — {e.response.text[:300]}")
@@ -580,106 +535,110 @@ if st.session_state.logged_in:
                         st.error(f"❌ Erro inesperado: {e}")
 
         # --- EXIBIÇÃO DO RELATÓRIO ---
-        if st.session_state.ai_report:
+        relatorio = st.session_state.get(f"ai_report_{unidade_id}")
+        if relatorio:
             st.markdown("---")
             st.markdown(f"### 📋 Relatório Técnico Qwen — {ubs_selecionada}")
-            st.markdown(
-                f"<div class='report-box'>{st.session_state.ai_report.replace(chr(10), '<br>')}</div>",
-                unsafe_allow_html=True
-            )
+            # Markdown puro (sem unsafe_allow_html): a resposta do modelo não é HTML confiável.
+            with st.container(border=True):
+                st.markdown(relatorio)
 
             # Botão de download do relatório
             st.download_button(
                 label="⬇️ Baixar Relatório (.txt)",
-                data=st.session_state.ai_report.encode("utf-8"),
+                data=relatorio.encode("utf-8"),
                 file_name=f"Relatorio_Qwen_{unidade_id}.txt",
                 mime="text/plain"
             )
 
 # ==========================================================
-# ABA 3 — BANCO DE DOCUMENTOS (FIREBASE STORAGE 200MB)
+# ABA 3 — BANCO DE DOCUMENTOS (pacote storage/: Firebase ou local)
 # ==========================================================
 if st.session_state.logged_in:
     with aba_docs:
         st.subheader(f"📁 Repositório de Documentos — {ubs_selecionada}")
-        st.caption(f"Caminho no Firebase Storage: `unidades_saude/{unidade_id}/`")
+        destino = "Firebase Storage (nuvem)" if store.name == "firebase" else "armazenamento local (data/uploads)"
+        st.caption(f"Destino dos arquivos: {destino}")
 
         st.markdown("---")
-        st.markdown("#### ⬆️ Upload de Evidência (máx. 200 MB)")
+        st.markdown(f"#### ⬆️ Upload de Evidência (máx. {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB)")
 
-        arquivo = st.file_uploader(
-            label="Selecione imagem ou PDF para anexar:",
-            type=["png", "jpg", "jpeg", "pdf"],
-            accept_multiple_files=False,
-            help="Formatos aceitos: .png, .jpg, .jpeg, .pdf · Tamanho máximo: 200 MB"
-        )
-
-        col_cat, col_desc = st.columns([1, 2])
-        with col_cat:
-            categoria = st.selectbox(
-                "Categoria do arquivo:",
-                ["FOTO_EQUIPAMENTO", "PRONTUARIO_EVIDENCIA", "RELATORIO_TECNICO", "PRINT_ESUS", "OUTRO"]
+        # form + clear_on_submit: após enviar, o uploader é limpo e o mesmo
+        # arquivo não é reenviado a cada re-execução do script.
+        with st.form("form_upload", clear_on_submit=True):
+            arquivos = st.file_uploader(
+                label="Selecione imagens ou PDFs para anexar:",
+                type=["png", "jpg", "jpeg", "pdf"],
+                accept_multiple_files=True,
+                help="Formatos aceitos: .png, .jpg, .jpeg, .pdf · Tamanho máximo: 200 MB por arquivo"
             )
-        with col_desc:
-            descricao_arquivo = st.text_input(
-                "Descrição breve da evidência:",
-                placeholder="Ex: Foto das fichas CDS em papel acumuladas na triagem"
-            )
-
-        if arquivo is not None:
-            # Validação de tamanho (200 MB)
-            if arquivo.size > MAX_FILE_SIZE_BYTES:
-                tamanho_mb = arquivo.size / (1024 * 1024)
-                st.error(
-                    f"❌ Arquivo rejeitado: **{arquivo.name}** ({tamanho_mb:.1f} MB) "
-                    f"ultrapassa o limite máximo de **200 MB**."
+            col_cat, col_desc = st.columns([1, 2])
+            with col_cat:
+                categoria = st.selectbox("Categoria do arquivo:", CATEGORIES)
+            with col_desc:
+                descricao_arquivo = st.text_input(
+                    "Descrição breve da evidência:",
+                    placeholder="Ex: Foto das fichas CDS em papel acumuladas na triagem"
                 )
-            else:
-                tamanho_kb = arquivo.size / 1024
-                tamanho_display = f"{tamanho_kb / 1024:.1f} MB" if tamanho_kb > 1024 else f"{tamanho_kb:.0f} KB"
-                st.info(f"📎 **{arquivo.name}** · {tamanho_display} · {arquivo.type}")
+            enviar = st.form_submit_button("📤 Enviar", type="primary")
 
-                if st.button("📤 Confirmar Upload para Firebase Storage", type="primary"):
-                    with st.spinner("Enviando arquivo..."):
-                        file_bytes = arquivo.read()
-                        public_url = upload_to_firebase_storage(
-                            file_bytes=file_bytes,
-                            file_name=arquivo.name,
+        if enviar and arquivos:
+            with st.spinner("Enviando arquivo(s)..."):
+                for arquivo in arquivos:
+                    try:
+                        salvo = upload(
+                            store,
+                            arquivo.getvalue(),
+                            arquivo.name,
                             unidade_id=unidade_id,
-                            content_type=arquivo.type
+                            unidade_nome=ubs_selecionada,
+                            category=categoria,
+                            description=descricao_arquivo,
+                            uploaded_by="admin",  # trocar pelo usuário real quando houver Firebase Auth
                         )
-
-                        registro = {
-                            "ubs": ubs_selecionada,
-                            "nome": arquivo.name,
-                            "tamanho": tamanho_display,
-                            "categoria": categoria,
-                            "descricao": descricao_arquivo,
-                            "url_firebase": public_url or "(salvo localmente)",
-                        }
-
-                        # Evitar duplicatas por nome na sessão
-                        nomes_existentes = [f["nome"] for f in st.session_state.uploaded_files]
-                        if arquivo.name not in nomes_existentes:
-                            st.session_state.uploaded_files.append(registro)
-
-                        destino = "Firebase Storage (nuvem) ✅" if public_url else "Sessão local (Firebase offline)"
                         st.markdown(
-                            f"<div class='upload-success'>✅ Upload concluído! · Destino: {destino}</div>",
+                            f"<div class='upload-success'>✅ {salvo.file_name} "
+                            f"({format_size(salvo.size)}) salvo com sucesso.</div>",
                             unsafe_allow_html=True
                         )
-                        if public_url:
-                            st.code(public_url, language="text")
+                    except UploadError as e:
+                        st.error(f"❌ {arquivo.name}: {e}")
+                    except Exception as e:
+                        st.error(f"❌ Falha ao salvar {arquivo.name}: {e}")
 
-        # --- LISTA DE DOCUMENTOS DESTA UBS ---
-        docs_ubs = [f for f in st.session_state.uploaded_files if f.get("ubs") == ubs_selecionada]
-        if docs_ubs:
-            st.markdown("---")
+        # --- LISTA DE DOCUMENTOS DESTA UBS (persistente) ---
+        try:
+            docs_ubs = store.list(unidade_id)
+        except Exception as e:
+            docs_ubs = []
+            st.error(f"❌ Não foi possível listar os documentos: {e}")
+
+        st.markdown("---")
+        if not docs_ubs:
+            st.info("Nenhum documento enviado para esta unidade.")
+        else:
             st.markdown(f"#### 🗂️ Documentos Registrados ({len(docs_ubs)})")
             for doc in docs_ubs:
-                with st.expander(f"📄 {doc['nome']} · {doc.get('tamanho', '')} · {doc.get('categoria', '')}"):
-                    st.write(f"**Descrição:** {doc.get('descricao', 'Sem descrição')}")
-                    if doc.get("url_firebase") and doc["url_firebase"].startswith("http"):
-                        st.markdown(f"[🔗 Abrir no Firebase Storage]({doc['url_firebase']})")
-        else:
-            st.info("Nenhum documento enviado para esta unidade nesta sessão.")
+                data_envio = doc.uploaded_at[:16].replace("T", " ")
+                with st.expander(f"📄 {doc.file_name} · {format_size(doc.size)} · {doc.category} · {data_envio}"):
+                    st.write(f"**Descrição:** {doc.description or 'Sem descrição'}")
+
+                    # Conteúdo só é baixado do backend quando o usuário pede,
+                    # para não transferir todos os arquivos a cada re-execução.
+                    if st.toggle("Visualizar / baixar", key=f"ver_{doc.id}"):
+                        try:
+                            conteudo = store.read(doc.id)
+                            if doc.is_image:
+                                st.image(conteudo, caption=doc.file_name)
+                            st.download_button(
+                                "⬇️ Baixar arquivo", data=conteudo,
+                                file_name=doc.file_name, mime=doc.content_type,
+                                key=f"dl_{doc.id}"
+                            )
+                        except Exception as e:
+                            st.error(f"❌ Erro ao ler o arquivo: {e}")
+
+                    confirmar = st.checkbox("Confirmo que desejo excluir este arquivo", key=f"conf_{doc.id}")
+                    if st.button("🗑️ Excluir", key=f"del_{doc.id}", disabled=not confirmar):
+                        store.delete(doc.id)
+                        st.rerun()

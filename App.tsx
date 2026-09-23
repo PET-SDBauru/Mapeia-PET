@@ -487,7 +487,6 @@ export default function App() {
   const [aiResponse, setAiResponse] = useState<string>("");
   const [loading, setLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string>("");
-  const [isDemoMode, setIsDemoMode] = useState<boolean>(true);
 
   // Atualiza os dados quantitativos e notas ao trocar a UBS
   useEffect(() => {
@@ -498,15 +497,6 @@ export default function App() {
     setAiResponse("");
     setErrorMsg("");
   }, [selectedUBS]);
-
-  // Atualiza o modo de demonstração conforme a chave
-  useEffect(() => {
-    if (!qwenApiKey) {
-      setIsDemoMode(true);
-    } else {
-      setIsDemoMode(false);
-    }
-  }, [qwenApiKey]);
 
   // Alterna accordion
   const toggleAccordion = (qId: string) => {
@@ -647,8 +637,7 @@ Seja extremamente detalhado, técnico e forneça orientações aplicáveis à re
       setAiResponse(data.text);
     } catch (err: any) {
       console.error(err);
-      setErrorMsg(err.message || "Servidor offline ou chave não configurada. Ativando fallback de demonstração local.");
-      setIsDemoMode(true);
+      setErrorMsg(err.message || "Servidor offline ou chave não configurada.");
     } finally {
       setLoading(false);
     }
@@ -665,6 +654,14 @@ Seja extremamente detalhado, técnico e forneça orientações aplicáveis à re
     const initializeLeafletMap = () => {
       const L = (window as any).L;
       if (!L || !mapRef.current) return;
+
+      // O container do mapa só existe no modo A: ao voltar do modo B ele é um
+      // <div> novo, então o mapa antigo (preso ao div removido) é descartado.
+      if (leafletMapInstance.current && leafletMapInstance.current.getContainer() !== mapRef.current) {
+        leafletMapInstance.current.remove();
+        leafletMapInstance.current = null;
+        leafletMarkersRef.current = {};
+      }
 
       const targetCoords = ubsCoordinates[selectedUBS] || { lat: -22.4687, lon: -48.9858 };
 
@@ -743,13 +740,18 @@ Seja extremamente detalhado, técnico e forneça orientações aplicáveis à re
     }
 
     if (!(window as any).L) {
-      const script = document.createElement("script");
-      script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
-      script.async = true;
-      script.onload = () => {
+      // Um único <script>, mesmo se a UBS mudar antes de o Leaflet terminar de carregar.
+      let script = document.getElementById("leaflet-js") as HTMLScriptElement | null;
+      if (!script) {
+        script = document.createElement("script");
+        script.id = "leaflet-js";
+        script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+        script.async = true;
+        document.head.appendChild(script);
+      }
+      script.addEventListener("load", () => {
         if (active) initializeLeafletMap();
-      };
-      document.head.appendChild(script);
+      });
     } else {
       initializeLeafletMap();
     }
@@ -757,7 +759,7 @@ Seja extremamente detalhado, técnico e forneça orientações aplicáveis à re
     return () => {
       active = false;
     };
-  }, [selectedUBS]);
+  }, [selectedUBS, analysisMode]);
 
   // Exportar relatório em formato texto
   const handleDownloadReport = () => {
@@ -804,7 +806,7 @@ Seja extremamente detalhado, técnico e forneça orientações aplicáveis à re
             className="w-full bg-[#262730] border border-slate-600 rounded-lg px-3 py-2 text-xs text-slate-300 focus:ring-1 focus:ring-blue-500 outline-none placeholder-slate-500 transition-all duration-200"
           />
           <p className="text-[9px] text-slate-500 italic">
-            Qwen 2.5 {qwenApiKey ? "Conectado" : "(Modo Fallback / Demonstração Ativo)"}
+            Qwen 2.5 {qwenApiKey ? "Conectado" : "(Sem chave de API)"}
           </p>
         </div>
 
